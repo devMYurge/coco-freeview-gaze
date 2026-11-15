@@ -1,7 +1,6 @@
 data/
 cache/
-figures/
 .ipynb_checkpoints/
 __pycache__/
-anaconda_projects/
 .venv/
+anaconda_projects/

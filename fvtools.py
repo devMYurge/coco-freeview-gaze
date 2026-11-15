@@ -51,8 +51,10 @@ def load_fixations(path: str) -> pd.DataFrame:
         Y = np.asarray(sp["Y"], float)
         T = np.asarray(sp.get("T", [np.nan] * len(X)), float)
         for k in range(len(X)):
-            rows.append((sid, sp["name"], sp.get("subject"), sp.get("split"), k, X[k], Y[k], T[k]))
-    df = pd.DataFrame(rows, columns=["scan", "image", "subject", "split", "idx", "x", "y", "dur"])
+            rows.append((sid, sp["name"], sp.get("subject"), sp.get("split"), k, X[k], Y[k], T[k],
+                         k == len(X) - 1))
+    df = pd.DataFrame(rows, columns=["scan", "image", "subject", "split", "idx", "x", "y", "dur",
+                                     "is_last"])
     return df
 
 
@@ -324,7 +326,11 @@ def score_image(name, stim, coco: CocoIndex, fix_own: pd.DataFrame, fix_donor: p
         "objects": zscore_in(ndimage.gaussian_filter(obj, 1.0), valid),
     }
     area_frac = obj[valid].mean()
-    cat = np.array([coco.cat_name[a["category_id"]] for a in anns] + ["background"])
+    n_valid = valid.sum()
+    # share of the image covered by the single largest object (largest = first painted, may be
+    # partly overpainted by smaller ones, so use the annotation's own area scaled to the grid)
+    max_obj_frac = max((a["area"] * tf.sx * tf.sy / GRID_DS**2 for a in anns), default=0.0) / n_valid
+    cat =np.array([coco.cat_name[a["category_id"]] for a in anns] + ["background"])
     sup = np.array([coco.cat_super[a["category_id"]] for a in anns] + ["background"])
 
     def rows(f, kind):
@@ -343,7 +349,7 @@ def score_image(name, stim, coco: CocoIndex, fix_own: pd.DataFrame, fix_donor: p
         return r[r.in_content]
 
     info = {"image": name, "mode": tf.mode, "iou": tf.iou, "obj_area_frac": area_frac,
-            "n_objects": len(anns)}
+            "max_obj_frac": min(max_obj_frac, 1.0), "n_objects": len(anns)}
     if keep_maps:
         info["maps"] = {k: v.copy() for k, v in maps.items()}
         info["glab"] = glab
@@ -370,6 +376,64 @@ def bootstrap_by_index(df: pd.DataFrame, value: str, max_idx: int, n_boot: int =
         "hi": np.nanpercentile(boots, 97.5, axis=0),
         "n_images": np.sum(~np.isnan(M), axis=0),
     })
+
+
+def _logit_fit(X: np.ndarray, y: np.ndarray, sw: np.ndarray | None = None,
+               l2: float = 1e-4, iters: int = 50) -> np.ndarray:
+    """Weighted logistic regression by Newton/IRLS. X must already include an intercept column.
+
+    sw are row weights (a cluster bootstrap = weight each row by how often its image was drawn).
+    A tiny L2 penalty (not on the intercept) keeps it stable in small bootstrap samples.
+    """
+    sw = np.ones(len(y)) if sw is None else sw
+    w = np.zeros(X.shape[1])
+    pen = np.full(X.shape[1], l2)
+    pen[0] = 0.0
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-np.clip(X @ w, -30, 30)))
+        g = X.T @ (sw * (y - p)) - pen * w
+        H = (X * (sw * p * (1 - p))[:, None]).T @ X + np.diag(pen)
+        step = np.linalg.solve(H, g)
+        w += step
+        if np.abs(step).max() < 1e-8:
+            break
+    return w
+
+
+def joint_by_index(own: pd.DataFrame, shuf: pd.DataFrame, max_idx: int,
+                   predictors=("nss_contrast", "nss_objects"), n_boot: int = 300,
+                   seed: int = 0) -> pd.DataFrame:
+    """For each fixation index: does each map still predict *fixated vs. control* locations
+    once the other map is in the model?
+
+    Positives = own fixations on an image; negatives = the shuffled-control fixations scored on
+    the same image (other people's gaze from another image, so they share the centre bias but
+    not this image's content). The model is fitted per index:
+
+        logit P(fixated) = b0 + b_contrast * contrast + b_objects * objects
+
+    Predictors are the z-scored map values (as in NSS), so coefficients are on the same scale:
+    log-odds change per 1 SD of the map. 95% CIs resample images.
+    """
+    cols = list(predictors)
+    d = pd.concat([own.assign(y=1.0), shuf.assign(y=0.0)])
+    d = d[(d.idx <= max_idx)].dropna(subset=cols)
+    rng = np.random.default_rng(seed)
+    out = []
+    for k, dk in d.groupby("idx"):
+        codes, names = pd.factorize(dk.map_image)
+        X = np.column_stack([np.ones(len(dk))] + [dk[c].to_numpy(float) for c in cols])
+        y = dk.y.to_numpy(float)
+        est = _logit_fit(X, y)[1:]
+        boots = np.empty((n_boot, len(cols)))
+        for b in range(n_boot):
+            draws = np.bincount(rng.integers(0, len(names), len(names)), minlength=len(names))
+            boots[b] = _logit_fit(X, y, sw=draws[codes].astype(float))[1:]
+        for j, c in enumerate(cols):
+            out.append({"idx": k, "map": c.replace("nss_", ""), "coef": est[j],
+                        "lo": np.percentile(boots[:, j], 2.5), "hi": np.percentile(boots[:, j], 97.5),
+                        "n": len(dk)})
+    return pd.DataFrame(out)
 
 
 def add_saccades(fix: pd.DataFrame, px_per_deg: float | None = None) -> pd.DataFrame:
