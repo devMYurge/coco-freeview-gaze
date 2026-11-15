@@ -1,0 +1,8 @@
+numpy
+scipy
+pandas
+matplotlib
+pillow
+pycocotools
+jupyterlab
+h11>=0.16
